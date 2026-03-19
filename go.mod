@@ -33,4 +33,4 @@ require (
 	tinygo.org/x/bluetooth v0.14.0 // indirect
 )
 
-replace github.com/svanichkin/go-reticulum => /home/kabili/Projects/Go/go-reticulum
+replace github.com/svanichkin/go-reticulum => /home/kabili/Projects/Go/go-reticulum-up
