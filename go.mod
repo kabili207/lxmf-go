@@ -32,3 +32,5 @@ require (
 	golang.org/x/sys v0.39.0 // indirect
 	tinygo.org/x/bluetooth v0.14.0 // indirect
 )
+
+replace github.com/svanichkin/go-reticulum => /home/kabili/Projects/Go/go-reticulum

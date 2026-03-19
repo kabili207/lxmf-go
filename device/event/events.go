@@ -30,6 +30,10 @@ type MessageReceived struct {
 	// Messages that fail verification still emit this event with Verified=false
 	// so callers can decide how to handle them (log, drop, quarantine).
 	Verified bool
+
+	// StampValid is true if the message's stamp or ticket was validated
+	// successfully (or if the router does not require stamps).
+	StampValid bool
 }
 
 // PeerAnnounced is emitted when an lxmf.delivery announce is received from
