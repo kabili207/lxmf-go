@@ -296,9 +296,10 @@ func (r *LXMRouter) sendDirect(destHash []byte, msg *core.LXMessage, packed []by
 	msgID := msg.ID()
 	msgLen := len(msg.Content)
 
-	// Try to reuse an existing link (backchannel first, then direct).
-	if link := r.getActiveLink(destKey); link != nil {
-		r.log.Debug("Reusing existing link for direct delivery",
+	// Only reuse outbound links we initiated — backchannel (inbound) links are
+	// controlled by the remote peer and may be torn down at any moment.
+	if link := r.getActiveDirectLink(destKey); link != nil {
+		r.log.Debug("Reusing existing outbound link for direct delivery",
 			"to", fmt.Sprintf("%x", destHash[:8]),
 			"id", msgID,
 		)
