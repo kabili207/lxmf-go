@@ -63,3 +63,23 @@ type DeliveryUpdate struct {
 	// State is the new delivery state.
 	State core.State
 }
+
+// PropagationNodeAnnounced is emitted when an lxmf.propagation announce is
+// received from a propagation node.
+type PropagationNodeAnnounced struct {
+	DestinationHash []byte
+	Identity        *rns.Identity
+	Enabled         bool // whether propagation is active on this node
+	TransferLimit   int  // per-transfer limit in KB
+	SyncLimit       int  // per-sync limit in KB
+	StampCost       int  // PoW cost required for propagation
+	Timebase        int  // node's current time (Unix seconds)
+}
+
+// PropagationSyncUpdate is emitted during a message download from a
+// propagation node to report progress and completion.
+type PropagationSyncUpdate struct {
+	State    core.PropagationTransferState
+	Progress float64
+	Messages int // number of messages received (set on PRComplete)
+}

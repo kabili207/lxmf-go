@@ -21,9 +21,13 @@ type outboundEntry struct {
 	Packed   []byte
 	Method   DeliveryMethod
 
-	Attempts         int
-	NextAttempt      time.Time
-	State            core.State
+	// PropagationPacked is the msgpack-wrapped encrypted payload for
+	// DeliveryPropagated messages. Nil for other methods.
+	PropagationPacked []byte
+
+	Attempts    int
+	NextAttempt time.Time
+	State       core.State
 }
 
 // outboundQueue manages pending outbound LXMF messages with retry logic.

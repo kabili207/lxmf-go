@@ -15,6 +15,7 @@ import (
 	"github.com/kabili207/lxmf-go/core"
 	"github.com/kabili207/lxmf-go/device/event"
 	rns "github.com/svanichkin/go-reticulum/rns"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 const (
@@ -41,6 +42,10 @@ const (
 	// DeliveryDirect establishes an RNS link to the recipient before sending.
 	// Provides delivery confirmation via link-level proof.
 	DeliveryDirect
+
+	// DeliveryPropagated sends the message to a propagation node which stores
+	// and forwards it to the recipient when they come online.
+	DeliveryPropagated
 )
 
 // RouterConfig holds configuration for an LXMRouter.
@@ -93,6 +98,13 @@ type LXMRouter struct {
 	tickets  *core.TicketStore
 	outbound *outboundQueue
 	stopCh   chan struct{}
+
+	// Propagation node client state.
+	propagationMu       sync.Mutex
+	propagationNode     []byte                       // configured PN destination hash
+	propagationLink     *rns.Link                    // active link to the PN
+	propagationState    core.PropagationTransferState // current sync state
+	propagationProgress float64                      // 0.0-1.0 during download
 
 	// deliveredMu protects deliveredIDs.
 	deliveredMu  sync.Mutex
@@ -192,8 +204,9 @@ func (r *LXMRouter) Start() error {
 	dest.AcceptsLinks(true)
 	dest.SetLinkEstablishedCallback(r.handleLinkEstablished)
 
-	// Register announce handler for peer discovery.
+	// Register announce handlers for peer and propagation node discovery.
 	rns.RegisterAnnounceHandler(&deliveryAnnounceHandler{router: r})
+	rns.RegisterAnnounceHandler(&propagationAnnounceHandler{router: r})
 
 	r.log.Info("LXMF router started",
 		"hash", fmt.Sprintf("%x", dest.Hash()),
@@ -309,6 +322,35 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 		method = DeliveryDirect
 	}
 
+	// For propagated delivery, encrypt and wrap in the propagation container.
+	var propagationPacked []byte
+	if method == DeliveryPropagated {
+		peerIdentity := rns.IdentityRecall(destHash)
+		if peerIdentity == nil {
+			return fmt.Errorf("cannot propagate: recipient identity unknown for %x", destHash[:8])
+		}
+		outDest, err := rns.NewDestination(peerIdentity, rns.DestinationOUT, rns.DestinationSINGLE, core.AppName, core.DeliveryAspect)
+		if err != nil {
+			return fmt.Errorf("create destination for propagation encryption: %w", err)
+		}
+
+		encrypted := outDest.Encrypt(packed[core.DestHashSize:])
+		lxmfData := make([]byte, 0, core.DestHashSize+len(encrypted))
+		lxmfData = append(lxmfData, packed[:core.DestHashSize]...)
+		lxmfData = append(lxmfData, encrypted...)
+
+		// TODO: Generate propagation stamp (PoW on transient_id with
+		// WorkblockExpandRoundsPN) when PN stamp enforcement is needed.
+
+		propagationPacked, err = msgpack.Marshal([]any{
+			float64(time.Now().Unix()),
+			[]any{lxmfData},
+		})
+		if err != nil {
+			return fmt.Errorf("pack propagation container: %w", err)
+		}
+	}
+
 	// Pre-request a path for opportunistic delivery if we don't have one.
 	nextAttempt := time.Now()
 	if method == DeliveryOpportunistic && !rns.HasPath(destHash) {
@@ -317,12 +359,13 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 	}
 
 	r.outbound.add(&outboundEntry{
-		DestHash:    destHash,
-		Message:     msg,
-		Packed:      packed,
-		Method:      method,
-		State:       core.StateOutbound,
-		NextAttempt: nextAttempt,
+		DestHash:          destHash,
+		Message:           msg,
+		Packed:            packed,
+		Method:            method,
+		PropagationPacked: propagationPacked,
+		State:             core.StateOutbound,
+		NextAttempt:       nextAttempt,
 	})
 
 	r.emit(&event.DeliveryUpdate{MessageHash: msg.Hash, State: core.StateOutbound})
@@ -374,6 +417,8 @@ func (r *LXMRouter) processOutbound() {
 		switch e.Method {
 		case DeliveryDirect:
 			r.attemptDirect(e)
+		case DeliveryPropagated:
+			r.attemptPropagated(e)
 		default:
 			r.attemptOpportunistic(e)
 		}
