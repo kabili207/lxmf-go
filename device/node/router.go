@@ -153,6 +153,13 @@ func (r *LXMRouter) Start() error {
 	return nil
 }
 
+// Identity returns the RNS identity used by this router. Returns nil if the
+// router has not been started. Callers can use this to create additional RNS
+// destinations (e.g. nomadnetwork.node) that share the same identity.
+func (r *LXMRouter) Identity() *rns.Identity {
+	return r.identity
+}
+
 // DeliveryHash returns the 16-byte RNS truncated hash of this node's
 // lxmf.delivery destination. This is the address peers use to send us messages.
 func (r *LXMRouter) DeliveryHash() []byte {
