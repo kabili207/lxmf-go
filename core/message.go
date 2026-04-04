@@ -47,6 +47,11 @@ type LXMessage struct {
 	Stamp     []byte
 	StampCost int // target PoW cost (bits) for outbound stamp generation; 0 = none
 
+	// OutboundTicket is a ticket received from the peer that lets us bypass
+	// PoW stamp generation. If set when Sign is called, the stamp is computed
+	// as truncated_hash(ticket + message_id) instead of mined.
+	OutboundTicket []byte
+
 	// Derived on unpack / set on sign
 	Signature []byte // 64-byte Ed25519 signature
 	Hash      []byte // 32-byte SHA-256 message ID (not on wire; derived)
@@ -142,11 +147,16 @@ func (m *LXMessage) Sign(ctx context.Context, privKey ed25519.PrivateKey) error 
 
 	// Generate stamp if needed (requires the hash/message_id).
 	if m.StampCost > 0 && len(m.Stamp) == 0 {
-		stamp, _, err := GenerateStamp(ctx, m.Hash, m.StampCost, WorkblockExpandRounds)
-		if err != nil {
-			return fmt.Errorf("generate stamp: %w", err)
+		if len(m.OutboundTicket) == TicketLength {
+			// Cheap ticket-based stamp: truncated_hash(ticket + message_id).
+			m.Stamp = TruncatedHash(append(m.OutboundTicket, m.Hash...))
+		} else {
+			stamp, _, err := GenerateStamp(ctx, m.Hash, m.StampCost, WorkblockExpandRounds)
+			if err != nil {
+				return fmt.Errorf("generate stamp: %w", err)
+			}
+			m.Stamp = stamp
 		}
-		m.Stamp = stamp
 	}
 
 	// signed_part = dest_hash + src_hash + payload + message_hash

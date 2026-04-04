@@ -57,6 +57,11 @@ type RouterConfig struct {
 	// event but all messages are accepted regardless.
 	EnforceStamps bool
 
+	// IncludeTickets controls whether outbound messages include a PoW bypass
+	// ticket for the recipient so they can skip stamp generation on their
+	// reply. Requires StampCost > 0 to be meaningful.
+	IncludeTickets bool
+
 	// Logger defaults to slog.Default() if nil.
 	Logger *slog.Logger
 }
@@ -76,6 +81,8 @@ type LXMRouter struct {
 	mu       sync.RWMutex
 	handlers []event.Handler
 
+	tickets *core.TicketStore
+
 	// linkMu protects the backchannel and direct link maps.
 	linkMu           sync.Mutex
 	backchannelLinks map[string]*rns.Link // hex(destHash) → inbound link (peer identified)
@@ -92,6 +99,7 @@ func NewRouter(cfg RouterConfig) (*LXMRouter, error) {
 	return &LXMRouter{
 		cfg:              cfg,
 		log:              log,
+		tickets:          core.NewTicketStore(),
 		backchannelLinks: make(map[string]*rns.Link),
 		directLinks:      make(map[string]*rns.Link),
 	}, nil
@@ -199,6 +207,24 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 
 	msg.SourceHash = r.destination.Hash()
 	msg.DestinationHash = destHash
+	destHex := hex.EncodeToString(destHash)
+
+	// If we have an outbound ticket from this peer, attach it so that Sign
+	// can generate a cheap ticket-based stamp instead of mining PoW.
+	if msg.StampCost > 0 {
+		msg.OutboundTicket = r.tickets.GetOutboundTicket(destHex)
+	}
+
+	// Include a ticket for the recipient so they can skip PoW on their reply.
+	if r.cfg.IncludeTickets && r.cfg.StampCost > 0 {
+		if expires, ticket, ok := r.tickets.GenerateTicket(destHex); ok {
+			msg.Fields[core.FieldTicket] = []any{
+				float64(expires.Unix()),
+				ticket,
+			}
+			r.tickets.RecordTicketDelivery(destHex)
+		}
+	}
 
 	if err := msg.Sign(context.Background(), r.privKey); err != nil {
 		return fmt.Errorf("sign message: %w", err)
@@ -690,10 +716,27 @@ func (r *LXMRouter) dispatchMessage(msg *core.LXMessage) {
 		)
 	}
 
-	// Validate stamp if the router has a stamp cost configured.
+	sourceHex := hex.EncodeToString(msg.SourceHash)
+
+	// Remember any ticket the sender included so we can bypass PoW when
+	// replying to them.
+	if ticketField, ok := msg.Fields[core.FieldTicket]; ok {
+		if entry, ok := ticketField.([]any); ok && len(entry) >= 2 {
+			if expiresF, ok := entry[0].(float64); ok {
+				if ticket, ok := entry[1].([]byte); ok && len(ticket) == core.TicketLength {
+					expires := time.Unix(int64(expiresF), 0)
+					r.tickets.RememberTicket(sourceHex, expires, ticket)
+				}
+			}
+		}
+	}
+
+	// Validate stamp if the router has a stamp cost configured. Pass our
+	// inbound tickets for this sender so ticket-based stamps are accepted.
 	stampValid := true
 	if r.cfg.StampCost > 0 {
-		stampValid, _ = core.ValidateStamp(msg, r.cfg.StampCost, nil)
+		tickets := r.tickets.GetInboundTickets(sourceHex)
+		stampValid, _ = core.ValidateStamp(msg, r.cfg.StampCost, tickets)
 	}
 
 	if r.cfg.EnforceStamps && !stampValid {

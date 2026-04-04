@@ -77,9 +77,9 @@ func fullHash(data []byte) []byte {
 	return h[:]
 }
 
-// truncatedHash computes a truncated SHA-256 (first 16 bytes), matching
+// TruncatedHash computes a truncated SHA-256 (first 16 bytes), matching
 // RNS.Identity.truncated_hash.
-func truncatedHash(data []byte) []byte {
+func TruncatedHash(data []byte) []byte {
 	return fullHash(data)[:TruncatedHashSize]
 }
 
@@ -219,7 +219,7 @@ func ValidateStamp(msg *LXMessage, targetCost int, tickets [][]byte) (bool, int)
 	// Check tickets first (cheap comparison).
 	if len(tickets) > 0 && len(msg.Hash) > 0 {
 		for _, ticket := range tickets {
-			expected := truncatedHash(append(ticket, msg.Hash...))
+			expected := TruncatedHash(append(ticket, msg.Hash...))
 			if len(msg.Stamp) == len(expected) && hmac.Equal(msg.Stamp, expected) {
 				return true, CostTicket
 			}
