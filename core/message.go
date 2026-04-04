@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
@@ -43,7 +44,8 @@ type LXMessage struct {
 	// Stamp is the optional PoW stamp (32 bytes). Included as the 5th msgpack
 	// array element on the wire when present. The hash and signature are always
 	// computed over the 4-element payload (without the stamp).
-	Stamp []byte
+	Stamp     []byte
+	StampCost int // target PoW cost (bits) for outbound stamp generation; 0 = none
 
 	// Derived on unpack / set on sign
 	Signature []byte // 64-byte Ed25519 signature
@@ -122,9 +124,13 @@ func (m *LXMessage) packWirePayload() ([]byte, error) {
 	return msgpack.Marshal([]any{ts, title, content, fields})
 }
 
-// Sign computes the message hash and signs the message with the given Ed25519
-// private key (the source identity's signing key). Must be called before Pack.
-func (m *LXMessage) Sign(privKey ed25519.PrivateKey) error {
+// Sign computes the message hash, generates a stamp if StampCost is set, and
+// signs the message with the given Ed25519 private key. Must be called before
+// Pack.
+//
+// If StampCost > 0 and no Stamp is already set, a PoW stamp is mined. This
+// can be slow for high costs. Pass a cancellable context to abort early.
+func (m *LXMessage) Sign(ctx context.Context, privKey ed25519.PrivateKey) error {
 	payload, err := m.packPayload()
 	if err != nil {
 		return fmt.Errorf("pack payload for signing: %w", err)
@@ -133,6 +139,15 @@ func (m *LXMessage) Sign(privKey ed25519.PrivateKey) error {
 
 	hash := m.computeHash(payload)
 	m.Hash = hash
+
+	// Generate stamp if needed (requires the hash/message_id).
+	if m.StampCost > 0 && len(m.Stamp) == 0 {
+		stamp, _, err := GenerateStamp(ctx, m.Hash, m.StampCost, WorkblockExpandRounds)
+		if err != nil {
+			return fmt.Errorf("generate stamp: %w", err)
+		}
+		m.Stamp = stamp
+	}
 
 	// signed_part = dest_hash + src_hash + payload + message_hash
 	signed := make([]byte, 0, HeaderSize+len(payload)+len(hash))

@@ -3,6 +3,7 @@
 package node
 
 import (
+	"context"
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
@@ -199,7 +200,7 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 	msg.SourceHash = r.destination.Hash()
 	msg.DestinationHash = destHash
 
-	if err := msg.Sign(r.privKey); err != nil {
+	if err := msg.Sign(context.Background(), r.privKey); err != nil {
 		return fmt.Errorf("sign message: %w", err)
 	}
 
@@ -689,9 +690,11 @@ func (r *LXMRouter) dispatchMessage(msg *core.LXMessage) {
 		)
 	}
 
-	// Stamp validation placeholder — always valid for now. The full stamp/ticket
-	// system will be implemented separately; this wires up the enforcement flow.
+	// Validate stamp if the router has a stamp cost configured.
 	stampValid := true
+	if r.cfg.StampCost > 0 {
+		stampValid, _ = core.ValidateStamp(msg, r.cfg.StampCost, nil)
+	}
 
 	if r.cfg.EnforceStamps && !stampValid {
 		r.log.Warn("Dropping LXMF message with invalid stamp",
