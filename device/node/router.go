@@ -62,6 +62,11 @@ type RouterConfig struct {
 	// reply. Requires StampCost > 0 to be meaningful.
 	IncludeTickets bool
 
+	// DeliveryLimit is the maximum size in kilobytes of an inbound resource
+	// transfer (large LXMF message). Transfers exceeding this are rejected.
+	// Defaults to 1000 KB if zero.
+	DeliveryLimit int
+
 	// Logger defaults to slog.Default() if nil.
 	Logger *slog.Logger
 }
@@ -739,8 +744,27 @@ func (r *LXMRouter) handleLinkEstablished(link *rns.Link) {
 func (r *LXMRouter) configureLinkCallbacks(link *rns.Link) {
 	link.SetPacketCallback(r.handleLinkPacket)
 	_ = link.SetResourceStrategy(rns.LinkAcceptApp)
-	link.SetResourceCallback(func(adv *rns.ResourceAdvertisement) bool { return true })
+	link.SetResourceCallback(func(adv *rns.ResourceAdvertisement) bool {
+		limit := r.deliveryLimitBytes()
+		if limit > 0 && adv.D > limit {
+			r.log.Debug("Rejecting oversized LXMF resource transfer",
+				"size", adv.D,
+				"limit", limit,
+			)
+			return false
+		}
+		return true
+	})
 	link.SetResourceConcludedCallback(r.handleResourceConcluded)
+}
+
+// deliveryLimitBytes returns the delivery size limit in bytes.
+func (r *LXMRouter) deliveryLimitBytes() int {
+	limit := r.cfg.DeliveryLimit
+	if limit == 0 {
+		limit = 1000 // default 1000 KB
+	}
+	return limit * 1000
 }
 
 // handleRemoteIdentified is called when a remote peer identifies themselves on
