@@ -85,6 +85,10 @@ type LXMRouter struct {
 	outbound *outboundQueue
 	stopCh   chan struct{}
 
+	// deliveredMu protects deliveredIDs.
+	deliveredMu  sync.Mutex
+	deliveredIDs map[string]time.Time // hex(messageHash) → delivery time
+
 	// stampCostsMu protects stampCosts.
 	stampCostsMu sync.RWMutex
 	stampCosts   map[string]stampCostEntry // hex(destHash) → cached stamp cost
@@ -101,7 +105,16 @@ type stampCostEntry struct {
 	Updated time.Time
 }
 
-const stampCostExpiry = 45 * 24 * time.Hour
+const (
+	stampCostExpiry = 45 * 24 * time.Hour
+
+	// messageExpiry is how long message hashes are retained for dedup.
+	// Python uses MESSAGE_EXPIRY*6 = 180 days.
+	deliveredIDExpiry = 180 * 24 * time.Hour
+
+	// cleanupInterval controls how often expired dedup entries are purged.
+	cleanupInterval = 4 * time.Minute
+)
 
 // NewRouter creates a new LXMRouter. Call Start to begin processing.
 func NewRouter(cfg RouterConfig) (*LXMRouter, error) {
@@ -116,6 +129,7 @@ func NewRouter(cfg RouterConfig) (*LXMRouter, error) {
 		tickets:          core.NewTicketStore(),
 		outbound:         &outboundQueue{},
 		stopCh:           make(chan struct{}),
+		deliveredIDs:     make(map[string]time.Time),
 		stampCosts:       make(map[string]stampCostEntry),
 		backchannelLinks: make(map[string]*rns.Link),
 		directLinks:      make(map[string]*rns.Link),
@@ -312,10 +326,17 @@ func (r *LXMRouter) processOutboundLoop() {
 	ticker := time.NewTicker(processingInterval)
 	defer ticker.Stop()
 
+	cleanupTicker := time.NewTicker(cleanupInterval)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
 		case <-r.stopCh:
 			return
+		case <-cleanupTicker.C:
+			r.cleanDeliveredIDs()
+			r.tickets.Clean()
+			continue
 		case <-ticker.C:
 			r.processOutbound()
 		}
@@ -641,6 +662,19 @@ func (r *LXMRouter) getStampCost(destHex string) int {
 	return entry.Cost
 }
 
+// cleanDeliveredIDs removes expired entries from the delivered message cache.
+func (r *LXMRouter) cleanDeliveredIDs() {
+	r.deliveredMu.Lock()
+	defer r.deliveredMu.Unlock()
+
+	now := time.Now()
+	for k, t := range r.deliveredIDs {
+		if now.Sub(t) > deliveredIDExpiry {
+			delete(r.deliveredIDs, k)
+		}
+	}
+}
+
 // OnEvent registers an event handler. Handlers are called synchronously in
 // registration order when events are dispatched.
 func (r *LXMRouter) OnEvent(fn event.Handler) {
@@ -818,6 +852,20 @@ func (r *LXMRouter) dispatchMessage(msg *core.LXMessage) {
 			"from", fmt.Sprintf("%x", msg.SourceHash[:8]),
 		)
 	}
+
+	// Duplicate detection: drop messages we've already delivered.
+	msgHashHex := hex.EncodeToString(msg.Hash)
+	r.deliveredMu.Lock()
+	if _, dup := r.deliveredIDs[msgHashHex]; dup {
+		r.deliveredMu.Unlock()
+		r.log.Debug("Ignoring duplicate message",
+			"from", fmt.Sprintf("%x", msg.SourceHash[:8]),
+			"id", msg.ID(),
+		)
+		return
+	}
+	r.deliveredIDs[msgHashHex] = time.Now()
+	r.deliveredMu.Unlock()
 
 	sourceHex := hex.EncodeToString(msg.SourceHash)
 
