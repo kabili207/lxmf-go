@@ -40,9 +40,20 @@ type LXMessage struct {
 	Content   []byte
 	Fields    map[any]any // int key → value (msgpack dict)
 
+	// Stamp is the optional PoW stamp (32 bytes). Included as the 5th msgpack
+	// array element on the wire when present. The hash and signature are always
+	// computed over the 4-element payload (without the stamp).
+	Stamp []byte
+
 	// Derived on unpack / set on sign
 	Signature []byte // 64-byte Ed25519 signature
 	Hash      []byte // 32-byte SHA-256 message ID (not on wire; derived)
+
+	// canonicalPayload holds the msgpack-encoded 4-element payload (without
+	// stamp) as seen on the wire or as produced by packPayload. Used by Verify
+	// to avoid re-encoding, which could produce different bytes across msgpack
+	// implementations.
+	canonicalPayload []byte
 }
 
 // New creates an outbound LXMessage from the sender's delivery destination hash.
@@ -87,6 +98,30 @@ func (m *LXMessage) packPayload() ([]byte, error) {
 	return msgpack.Marshal([]any{ts, title, content, fields})
 }
 
+// packWirePayload encodes the payload as it appears on the wire. This is the
+// same as packPayload but includes the stamp as a 5th element when present.
+func (m *LXMessage) packWirePayload() ([]byte, error) {
+	ts := float64(m.Timestamp.UnixNano()) / 1e9
+
+	title := m.Title
+	if title == nil {
+		title = []byte{}
+	}
+	content := m.Content
+	if content == nil {
+		content = []byte{}
+	}
+	fields := m.Fields
+	if fields == nil {
+		fields = make(map[any]any)
+	}
+
+	if len(m.Stamp) > 0 {
+		return msgpack.Marshal([]any{ts, title, content, fields, m.Stamp})
+	}
+	return msgpack.Marshal([]any{ts, title, content, fields})
+}
+
 // Sign computes the message hash and signs the message with the given Ed25519
 // private key (the source identity's signing key). Must be called before Pack.
 func (m *LXMessage) Sign(privKey ed25519.PrivateKey) error {
@@ -94,6 +129,7 @@ func (m *LXMessage) Sign(privKey ed25519.PrivateKey) error {
 	if err != nil {
 		return fmt.Errorf("pack payload for signing: %w", err)
 	}
+	m.canonicalPayload = payload
 
 	hash := m.computeHash(payload)
 	m.Hash = hash
@@ -122,7 +158,9 @@ func (m *LXMessage) Pack() ([]byte, error) {
 		return nil, fmt.Errorf("destination or source hash has wrong length")
 	}
 
-	payload, err := m.packPayload()
+	// The wire payload includes the stamp as a 5th element when present.
+	// The hash and signature were computed over the 4-element payload only.
+	payload, err := m.packWirePayload()
 	if err != nil {
 		return nil, fmt.Errorf("pack payload: %w", err)
 	}
@@ -148,15 +186,34 @@ func Unpack(data []byte) (*LXMessage, error) {
 		Signature:       data[DestHashSize*2 : HeaderSize],
 	}
 
-	payload := data[HeaderSize:]
+	rawPayload := data[HeaderSize:]
 
-	// Decode [timestamp_float64, title_bytes, content_bytes, fields_dict]
+	// Decode [timestamp, title, content, fields, stamp?]
 	var parts []msgpack.RawMessage
-	if err := msgpack.Unmarshal(payload, &parts); err != nil {
+	if err := msgpack.Unmarshal(rawPayload, &parts); err != nil {
 		return nil, fmt.Errorf("decode payload: %w", err)
 	}
 	if len(parts) < 4 {
 		return nil, fmt.Errorf("payload has %d elements, want ≥4", len(parts))
+	}
+
+	// Extract the optional stamp (5th element) and compute canonical payload.
+	// The hash and signature are always over the 4-element payload, so when a
+	// stamp is present we must strip it and repack before hashing.
+	if len(parts) > 4 {
+		if err := msgpack.Unmarshal(parts[4], &m.Stamp); err != nil {
+			return nil, fmt.Errorf("decode stamp: %w", err)
+		}
+		// Repack the 4-element payload for canonical hashing.
+		stripped := parts[:4]
+		canonical, err := msgpack.Marshal(stripped)
+		if err != nil {
+			return nil, fmt.Errorf("repack payload without stamp: %w", err)
+		}
+		m.canonicalPayload = canonical
+	} else {
+		// No stamp present; the wire bytes are already canonical.
+		m.canonicalPayload = rawPayload
 	}
 
 	// Timestamp: float64 seconds since epoch
@@ -178,17 +235,25 @@ func Unpack(data []byte) (*LXMessage, error) {
 		return nil, fmt.Errorf("decode fields: %w", err)
 	}
 
-	// Recompute message hash (same payload that was signed over)
-	m.Hash = m.computeHash(payload)
+	// Hash over the canonical 4-element payload (stamp excluded).
+	m.Hash = m.computeHash(m.canonicalPayload)
 
 	return m, nil
 }
 
 // Verify checks the Ed25519 signature against the source identity's public key.
+// For inbound messages, this uses the canonical payload bytes captured during
+// Unpack rather than re-encoding, which avoids cross-implementation msgpack
+// encoding differences.
 func (m *LXMessage) Verify(pubKey ed25519.PublicKey) bool {
-	payload, err := m.packPayload()
-	if err != nil {
-		return false
+	payload := m.canonicalPayload
+	if payload == nil {
+		// Outbound message or never unpacked; generate from struct fields.
+		var err error
+		payload, err = m.packPayload()
+		if err != nil {
+			return false
+		}
 	}
 
 	hash := m.computeHash(payload)
