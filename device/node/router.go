@@ -24,6 +24,10 @@ const (
 
 	// resourceTimeout is the timeout in seconds for resource transfers.
 	resourceTimeout = 300.0
+
+	// linkMaxInactivity is how long a direct link can go without data
+	// before being torn down. Matches Python's LINK_MAX_INACTIVITY.
+	linkMaxInactivity = 10 * 60.0 // 10 minutes, in seconds (float64 for NoDataFor)
 )
 
 // DeliveryMethod controls how outbound messages are sent.
@@ -341,6 +345,7 @@ func (r *LXMRouter) processOutboundLoop() {
 		case <-cleanupTicker.C:
 			r.cleanDeliveredIDs()
 			r.tickets.Clean()
+			r.cleanInactiveLinks()
 			continue
 		case <-ticker.C:
 			r.processOutbound()
@@ -676,6 +681,27 @@ func (r *LXMRouter) cleanDeliveredIDs() {
 	for k, t := range r.deliveredIDs {
 		if now.Sub(t) > deliveredIDExpiry {
 			delete(r.deliveredIDs, k)
+		}
+	}
+}
+
+// cleanInactiveLinks tears down links that have been idle for too long.
+func (r *LXMRouter) cleanInactiveLinks() {
+	r.linkMu.Lock()
+	defer r.linkMu.Unlock()
+
+	for k, link := range r.directLinks {
+		if link.Status != rns.LinkActive || link.NoDataFor() > linkMaxInactivity {
+			link.Teardown()
+			delete(r.directLinks, k)
+			r.log.Debug("Cleaned inactive direct link", "dest", k[:16])
+		}
+	}
+	for k, link := range r.backchannelLinks {
+		if link.Status != rns.LinkActive || link.NoDataFor() > linkMaxInactivity {
+			link.Teardown()
+			delete(r.backchannelLinks, k)
+			r.log.Debug("Cleaned inactive backchannel link", "dest", k[:16])
 		}
 	}
 }
