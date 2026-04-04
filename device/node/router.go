@@ -83,11 +83,23 @@ type LXMRouter struct {
 
 	tickets *core.TicketStore
 
+	// stampCostsMu protects stampCosts.
+	stampCostsMu sync.RWMutex
+	stampCosts   map[string]stampCostEntry // hex(destHash) → cached stamp cost
+
 	// linkMu protects the backchannel and direct link maps.
 	linkMu           sync.Mutex
 	backchannelLinks map[string]*rns.Link // hex(destHash) → inbound link (peer identified)
 	directLinks      map[string]*rns.Link // hex(destHash) → outbound link we initiated
 }
+
+// stampCostEntry is a cached stamp cost learned from a peer announce.
+type stampCostEntry struct {
+	Cost    int
+	Updated time.Time
+}
+
+const stampCostExpiry = 45 * 24 * time.Hour
 
 // NewRouter creates a new LXMRouter. Call Start to begin processing.
 func NewRouter(cfg RouterConfig) (*LXMRouter, error) {
@@ -100,6 +112,7 @@ func NewRouter(cfg RouterConfig) (*LXMRouter, error) {
 		cfg:              cfg,
 		log:              log,
 		tickets:          core.NewTicketStore(),
+		stampCosts:       make(map[string]stampCostEntry),
 		backchannelLinks: make(map[string]*rns.Link),
 		directLinks:      make(map[string]*rns.Link),
 	}, nil
@@ -208,6 +221,18 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 	msg.SourceHash = r.destination.Hash()
 	msg.DestinationHash = destHash
 	destHex := hex.EncodeToString(destHash)
+
+	// Auto-configure stamp cost from cached peer announces if the caller
+	// hasn't set one explicitly.
+	if msg.StampCost == 0 {
+		if cost := r.getStampCost(destHex); cost > 0 {
+			msg.StampCost = cost
+			r.log.Debug("Auto-configured stamp cost from announce",
+				"to", fmt.Sprintf("%x", destHash[:8]),
+				"cost", cost,
+			)
+		}
+	}
 
 	// If we have an outbound ticket from this peer, attach it so that Sign
 	// can generate a cheap ticket-based stamp instead of mining PoW.
@@ -536,6 +561,26 @@ func (r *LXMRouter) sendLinkResource(link *rns.Link, destHash []byte, packed []b
 		"len", msgLen,
 	)
 	r.emit(&event.DeliveryUpdate{MessageHash: msgHash, State: core.StateSent})
+}
+
+// updateStampCost caches the stamp cost advertised by a peer in their announce.
+func (r *LXMRouter) updateStampCost(destHash []byte, cost int) {
+	destHex := hex.EncodeToString(destHash)
+	r.stampCostsMu.Lock()
+	r.stampCosts[destHex] = stampCostEntry{Cost: cost, Updated: time.Now()}
+	r.stampCostsMu.Unlock()
+}
+
+// getStampCost returns the cached stamp cost for a destination, or 0 if
+// unknown or expired.
+func (r *LXMRouter) getStampCost(destHex string) int {
+	r.stampCostsMu.RLock()
+	entry, ok := r.stampCosts[destHex]
+	r.stampCostsMu.RUnlock()
+	if !ok || time.Since(entry.Updated) > stampCostExpiry {
+		return 0
+	}
+	return entry.Cost
 }
 
 // OnEvent registers an event handler. Handlers are called synchronously in

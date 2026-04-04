@@ -26,6 +26,8 @@ func (h *deliveryAnnounceHandler) ReceivedAnnounce(destHash []byte, identity *rn
 		"stamp_cost", stampCost,
 	)
 
+	h.router.updateStampCost(destHash, stampCost)
+
 	h.router.emit(&event.PeerAnnounced{
 		DestinationHash: destHash,
 		Identity:        identity,
