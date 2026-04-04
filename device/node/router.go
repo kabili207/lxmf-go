@@ -81,7 +81,9 @@ type LXMRouter struct {
 	mu       sync.RWMutex
 	handlers []event.Handler
 
-	tickets *core.TicketStore
+	tickets  *core.TicketStore
+	outbound *outboundQueue
+	stopCh   chan struct{}
 
 	// stampCostsMu protects stampCosts.
 	stampCostsMu sync.RWMutex
@@ -112,6 +114,8 @@ func NewRouter(cfg RouterConfig) (*LXMRouter, error) {
 		cfg:              cfg,
 		log:              log,
 		tickets:          core.NewTicketStore(),
+		outbound:         &outboundQueue{},
+		stopCh:           make(chan struct{}),
 		stampCosts:       make(map[string]stampCostEntry),
 		backchannelLinks: make(map[string]*rns.Link),
 		directLinks:      make(map[string]*rns.Link),
@@ -172,7 +176,19 @@ func (r *LXMRouter) Start() error {
 		"hash", fmt.Sprintf("%x", dest.Hash()),
 		"name", r.cfg.DisplayName,
 	)
+
+	go r.processOutboundLoop()
 	return nil
+}
+
+// Stop shuts down the background processing loop. The router should not be
+// used after calling Stop.
+func (r *LXMRouter) Stop() {
+	select {
+	case <-r.stopCh:
+	default:
+		close(r.stopCh)
+	}
 }
 
 // Identity returns the RNS identity used by this router. Returns nil if the
@@ -206,13 +222,12 @@ func (r *LXMRouter) Announce() error {
 	return nil
 }
 
-// Send delivers an outbound LXMessage using the specified delivery method.
-// The message is signed with this node's Ed25519 key before sending.
+// Send queues an outbound LXMessage for delivery using the specified method.
+// The message is signed, packed, and placed in the outbound queue. The
+// background processing loop handles delivery attempts with retry.
 //
-// For DeliveryOpportunistic, a single packet is sent with no confirmation.
-// For DeliveryDirect, an RNS link is established first; a DeliveryUpdate
-// event is emitted when the remote peer's proof is received or when the
-// attempt times out.
+// Send returns an error only if signing or packing fails. Delivery failures
+// are reported asynchronously via DeliveryUpdate events.
 func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMethod) error {
 	if r.destination == nil {
 		return fmt.Errorf("router not started")
@@ -261,9 +276,7 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 	}
 
 	// Auto-escalate to DIRECT delivery if the packed message exceeds the
-	// encrypted packet MDU. Opportunistic delivery to a SINGLE destination
-	// encrypts the payload, which limits it to PacketEncryptedMDU (383 bytes
-	// at the default 500-byte MTU). Larger messages must go over a link.
+	// encrypted packet MDU.
 	if method == DeliveryOpportunistic && len(packed)-core.DestHashSize > rns.PacketEncryptedMDU {
 		r.log.Debug("Message too large for opportunistic delivery, escalating to direct",
 			"to", fmt.Sprintf("%x", destHash[:8]),
@@ -273,125 +286,193 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 		method = DeliveryDirect
 	}
 
-	switch method {
-	case DeliveryDirect:
-		return r.sendDirect(destHash, msg, packed)
-	default:
-		return r.sendOpportunistic(destHash, msg, packed)
+	// Pre-request a path for opportunistic delivery if we don't have one.
+	nextAttempt := time.Now()
+	if method == DeliveryOpportunistic && !rns.HasPath(destHash) {
+		rns.RequestPath(destHash, nil)
+		nextAttempt = time.Now().Add(pathRequestWait)
+	}
+
+	r.outbound.add(&outboundEntry{
+		DestHash:    destHash,
+		Message:     msg,
+		Packed:      packed,
+		Method:      method,
+		State:       core.StateOutbound,
+		NextAttempt: nextAttempt,
+	})
+
+	r.emit(&event.DeliveryUpdate{MessageHash: msg.Hash, State: core.StateOutbound})
+	return nil
+}
+
+// processOutboundLoop runs in a background goroutine and periodically
+// processes the outbound queue, retrying failed deliveries.
+func (r *LXMRouter) processOutboundLoop() {
+	ticker := time.NewTicker(processingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.stopCh:
+			return
+		case <-ticker.C:
+			r.processOutbound()
+		}
 	}
 }
 
-// sendOpportunistic sends a single best-effort packet to the destination.
-// Only reuses outbound links we initiated (directLinks). Inbound backchannel
-// links are NOT reused because the remote peer controls their lifecycle and
-// may tear them down immediately after sending — replies sent over a dying
-// link are silently lost.
-func (r *LXMRouter) sendOpportunistic(destHash []byte, msg *core.LXMessage, packed []byte) error {
+// processOutbound attempts delivery for all ready entries in the queue.
+func (r *LXMRouter) processOutbound() {
+	ready := r.outbound.ready()
+	for _, e := range ready {
+		if e.Attempts >= maxDeliveryAttempts {
+			e.State = core.StateFailed
+			r.log.Warn("Max delivery attempts reached",
+				"to", fmt.Sprintf("%x", e.DestHash[:8]),
+				"id", e.Message.ID(),
+				"attempts", e.Attempts,
+			)
+			r.emit(&event.DeliveryUpdate{MessageHash: e.Message.Hash, State: core.StateFailed})
+			continue
+		}
+
+		e.Attempts++
+		e.State = core.StateSending
+
+		switch e.Method {
+		case DeliveryDirect:
+			r.attemptDirect(e)
+		default:
+			r.attemptOpportunistic(e)
+		}
+	}
+
+	// Clean up finished entries.
+	r.outbound.removeFinished()
+}
+
+// attemptOpportunistic performs a single opportunistic delivery attempt.
+func (r *LXMRouter) attemptOpportunistic(e *outboundEntry) {
+	destHash := e.DestHash
 	destKey := hex.EncodeToString(destHash)
 
-	// Only reuse links we initiated — we control their lifecycle.
+	// Reuse an outbound link if available.
 	if link := r.getActiveDirectLink(destKey); link != nil {
-		r.log.Debug("Sending reply over existing outbound link",
-			"to", fmt.Sprintf("%x", destHash[:8]),
-			"id", msg.ID(),
-		)
-		r.sendOverLink(link, destHash, packed, msg.Hash, msg.ID(), len(msg.Content))
-		return nil
+		r.sendOverLink(link, destHash, e.Packed, e.Message.Hash, e.Message.ID(), len(e.Message.Content))
+		e.State = core.StateSent
+		r.emit(&event.DeliveryUpdate{MessageHash: e.Message.Hash, State: core.StateSent})
+		return
 	}
 
 	peerIdentity := rns.IdentityRecall(destHash)
 	if peerIdentity == nil {
-		r.log.Warn("Peer identity unknown, requesting path", "dest", fmt.Sprintf("%x", destHash))
+		r.log.Debug("Peer identity unknown, requesting path",
+			"dest", fmt.Sprintf("%x", destHash[:8]),
+			"attempt", e.Attempts,
+		)
 		rns.RequestPath(destHash, nil)
-		return fmt.Errorf("peer identity unknown for %x; path request sent", destHash[:8])
+		e.NextAttempt = time.Now().Add(pathRequestWait)
+		e.State = core.StateOutbound
+		return
 	}
 
-	// Ensure we have a path before sending. If not, request one and wait
-	// briefly — the path table is populated from announces which may not have
-	// arrived yet when the router first starts.
 	if !rns.HasPath(destHash) {
-		r.log.Debug("No path yet, requesting", "dest", fmt.Sprintf("%x", destHash[:8]))
+		r.log.Debug("No path yet, requesting",
+			"dest", fmt.Sprintf("%x", destHash[:8]),
+			"attempt", e.Attempts,
+		)
 		rns.RequestPath(destHash, nil)
-		for i := 0; i < 10; i++ {
-			time.Sleep(200 * time.Millisecond)
-			if rns.HasPath(destHash) {
-				break
-			}
-		}
-		if !rns.HasPath(destHash) {
-			return fmt.Errorf("no path to %x after request; will retry on announce", destHash[:8])
-		}
+		e.NextAttempt = time.Now().Add(pathRequestWait)
+		e.State = core.StateOutbound
+		return
 	}
 
 	outDest, err := rns.NewDestination(peerIdentity, rns.DestinationOUT, rns.DestinationSINGLE, core.AppName, core.DeliveryAspect)
 	if err != nil {
-		return fmt.Errorf("create outbound destination: %w", err)
+		r.log.Warn("Failed to create outbound destination",
+			"dest", fmt.Sprintf("%x", destHash[:8]),
+			"error", err,
+		)
+		e.NextAttempt = time.Now().Add(deliveryRetryWait)
+		e.State = core.StateOutbound
+		return
 	}
 
-	// Strip dest_hash prefix — RNS encodes it in the packet header.
-	payload := packed[core.DestHashSize:]
+	payload := e.Packed[core.DestHashSize:]
 	pkt := rns.NewPacket(outDest, payload)
 	receipt := pkt.Send()
 	if receipt == nil {
-		return fmt.Errorf("packet send failed for %x (no interfaces or path)", destHash[:8])
+		r.log.Warn("Packet send failed",
+			"dest", fmt.Sprintf("%x", destHash[:8]),
+			"attempt", e.Attempts,
+		)
+		e.NextAttempt = time.Now().Add(deliveryRetryWait)
+		e.State = core.StateOutbound
+		return
 	}
 
 	r.log.Info("Sent LXMF message (opportunistic)",
 		"to", fmt.Sprintf("%x", destHash[:8]),
-		"id", msg.ID(),
-		"len", len(msg.Content),
+		"id", e.Message.ID(),
+		"len", len(e.Message.Content),
+		"attempt", e.Attempts,
 	)
-	r.emit(&event.DeliveryUpdate{MessageHash: msg.Hash, State: core.StateSent})
-	return nil
+	e.State = core.StateSent
+	r.emit(&event.DeliveryUpdate{MessageHash: e.Message.Hash, State: core.StateSent})
 }
 
-// sendDirect sends the message over an RNS link — reusing a backchannel or
-// direct link if one is already active, or establishing a new link otherwise.
-// Small messages are sent as link packets; large messages use resource transfers.
-// A DeliveryUpdate is emitted asynchronously on delivery confirmation or timeout.
-func (r *LXMRouter) sendDirect(destHash []byte, msg *core.LXMessage, packed []byte) error {
+// attemptDirect performs a single direct delivery attempt.
+func (r *LXMRouter) attemptDirect(e *outboundEntry) {
+	destHash := e.DestHash
 	destKey := hex.EncodeToString(destHash)
-	msgHash := msg.Hash
-	msgID := msg.ID()
-	msgLen := len(msg.Content)
+	msgHash := e.Message.Hash
+	msgID := e.Message.ID()
+	msgLen := len(e.Message.Content)
 
-	// Only reuse outbound links we initiated — backchannel (inbound) links are
-	// controlled by the remote peer and may be torn down at any moment.
+	// Reuse an outbound link if available.
 	if link := r.getActiveDirectLink(destKey); link != nil {
-		r.log.Debug("Reusing existing outbound link for direct delivery",
-			"to", fmt.Sprintf("%x", destHash[:8]),
-			"id", msgID,
-		)
-		r.sendOverLink(link, destHash, packed, msgHash, msgID, msgLen)
-		return nil
+		r.sendOverLink(link, destHash, e.Packed, msgHash, msgID, msgLen)
+		return
 	}
 
-	// No reusable link — establish a new outgoing link.
+	// Establish a new link.
 	peerIdentity := rns.IdentityRecall(destHash)
 	if peerIdentity == nil {
-		r.log.Warn("Peer identity unknown for direct delivery; attempting path request", "dest", fmt.Sprintf("%x", destHash))
+		r.log.Debug("Peer identity unknown for direct delivery, requesting path",
+			"dest", fmt.Sprintf("%x", destHash[:8]),
+			"attempt", e.Attempts,
+		)
+		rns.RequestPath(destHash, nil)
+		e.NextAttempt = time.Now().Add(pathRequestWait)
+		e.State = core.StateOutbound
+		return
+	}
+
+	if !rns.HasPath(destHash) {
+		rns.RequestPath(destHash, nil)
+		e.NextAttempt = time.Now().Add(pathRequestWait)
+		e.State = core.StateOutbound
+		return
 	}
 
 	outDest, err := rns.NewDestination(peerIdentity, rns.DestinationOUT, rns.DestinationSINGLE, core.AppName, core.DeliveryAspect)
 	if err != nil {
-		return fmt.Errorf("create outbound destination for direct delivery: %w", err)
+		e.NextAttempt = time.Now().Add(deliveryRetryWait)
+		e.State = core.StateOutbound
+		return
 	}
 
+	packed := e.Packed
 	link, err := rns.NewOutgoingLink(outDest, rns.LinkModeDefault,
 		func(l *rns.Link) {
 			r.log.Debug("Link established for direct LXMF delivery",
 				"to", fmt.Sprintf("%x", destHash[:8]),
 				"id", msgID,
 			)
-
-			// Identify ourselves so the remote can store us as a backchannel.
 			l.Identify(r.identity)
-
-			// Set up receive callbacks so we can accept messages on this
-			// link too (enables bidirectional communication).
 			r.configureLinkCallbacks(l)
 
-			// Store in directLinks for reuse.
 			r.linkMu.Lock()
 			r.directLinks[destKey] = l
 			r.linkMu.Unlock()
@@ -407,38 +488,15 @@ func (r *LXMRouter) sendDirect(destHash []byte, msg *core.LXMessage, packed []by
 		},
 	)
 	if err != nil {
-		return fmt.Errorf("create outgoing link: %w", err)
+		r.log.Warn("Failed to create outgoing link",
+			"dest", fmt.Sprintf("%x", destHash[:8]),
+			"error", err,
+		)
+		e.NextAttempt = time.Now().Add(deliveryRetryWait)
+		e.State = core.StateOutbound
+		return
 	}
-	_ = link // link lifecycle managed via callbacks above
-
-	return nil
-}
-
-// getActiveLink returns a reusable active link for the given destination key,
-// checking backchannel links first, then direct links.
-func (r *LXMRouter) getActiveLink(destKey string) *rns.Link {
-	r.linkMu.Lock()
-	defer r.linkMu.Unlock()
-
-	if link, ok := r.backchannelLinks[destKey]; ok && link.Status == rns.LinkActive {
-		return link
-	}
-	if link, ok := r.directLinks[destKey]; ok && link.Status == rns.LinkActive {
-		return link
-	}
-
-	// Clean up stale entries while we're here.
-	for k, l := range r.backchannelLinks {
-		if l.Status != rns.LinkActive {
-			delete(r.backchannelLinks, k)
-		}
-	}
-	for k, l := range r.directLinks {
-		if l.Status != rns.LinkActive {
-			delete(r.directLinks, k)
-		}
-	}
-	return nil
+	_ = link
 }
 
 // getActiveDirectLink returns an active outbound link we initiated. Unlike
