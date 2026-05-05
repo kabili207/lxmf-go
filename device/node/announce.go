@@ -14,7 +14,7 @@ type deliveryAnnounceHandler struct {
 	router *LXMRouter
 }
 
-func (h *deliveryAnnounceHandler) AspectFilter() string {
+func (h *deliveryAnnounceHandler) AspectFilter() any {
 	return "lxmf.delivery"
 }
 
@@ -42,7 +42,7 @@ type propagationAnnounceHandler struct {
 	router *LXMRouter
 }
 
-func (h *propagationAnnounceHandler) AspectFilter() string {
+func (h *propagationAnnounceHandler) AspectFilter() any {
 	return core.AppName + "." + core.PropagationAspect
 }
 
