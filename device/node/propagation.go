@@ -67,7 +67,7 @@ func (r *LXMRouter) RequestMessages() error {
 
 	if !rns.HasPath(nodeHash) {
 		r.propagationState = core.PRPathRequested
-		rns.RequestPath(nodeHash, nil)
+		rns.RequestPath(nodeHash, nil, nil, false)
 		r.emitSyncUpdate()
 
 		go r.waitForPropagationPath(nodeHash)
@@ -141,7 +141,7 @@ func (r *LXMRouter) establishPropagationLink(nodeHash []byte) error {
 	r.propagationState = core.PRLinkEstablishing
 	r.emitSyncUpdate()
 
-	link, err := rns.NewOutgoingLink(dest, rns.LinkModeDefault,
+	link, err := rns.NewLink(dest, nil, rns.LinkModeDefault,
 		func(l *rns.Link) {
 			r.propagationMu.Lock()
 			r.propagationLink = l
@@ -194,7 +194,7 @@ func (r *LXMRouter) sendListRequest(link *rns.Link) {
 
 // messageListResponse handles the response to the list request.
 func (r *LXMRouter) messageListResponse(rr *rns.RequestReceipt) {
-	resp := rr.Response()
+	resp := rr.GetResponse()
 
 	// Check for error codes (returned as integers).
 	if code, ok := asInt(resp); ok {
@@ -306,7 +306,7 @@ func (r *LXMRouter) messageListResponse(rr *rns.RequestReceipt) {
 
 // messageGetResponse handles the response containing actual message data.
 func (r *LXMRouter) messageGetResponse(rr *rns.RequestReceipt) {
-	resp := rr.Response()
+	resp := rr.GetResponse()
 
 	// Check for error codes.
 	if code, ok := asInt(resp); ok {
@@ -405,12 +405,12 @@ func (r *LXMRouter) messageGetResponse(rr *rns.RequestReceipt) {
 func (r *LXMRouter) messageGetProgress(rr *rns.RequestReceipt) {
 	r.propagationMu.Lock()
 	r.propagationState = core.PRReceiving
-	r.propagationProgress = rr.Progress()
+	r.propagationProgress = rr.GetProgress()
 	r.propagationMu.Unlock()
 
 	r.emit(&event.PropagationSyncUpdate{
 		State:    core.PRReceiving,
-		Progress: rr.Progress(),
+		Progress: rr.GetProgress(),
 	})
 }
 
@@ -470,7 +470,7 @@ func (r *LXMRouter) attemptPropagated(e *outboundEntry) {
 
 	// Need to establish a link to the PN first.
 	if !rns.HasPath(nodeHash) {
-		rns.RequestPath(nodeHash, nil)
+		rns.RequestPath(nodeHash, nil, nil, false)
 		e.NextAttempt = time.Now().Add(pathRequestWait)
 		e.State = core.StateOutbound
 		return
@@ -494,7 +494,7 @@ func (r *LXMRouter) attemptPropagated(e *outboundEntry) {
 	msgID := e.Message.ID()
 	propagationPacked := e.PropagationPacked
 
-	_, err = rns.NewOutgoingLink(dest, rns.LinkModeDefault,
+	_, err = rns.NewLink(dest, nil, rns.LinkModeDefault,
 		func(l *rns.Link) {
 			r.propagationMu.Lock()
 			r.propagationLink = l
@@ -542,7 +542,7 @@ func (r *LXMRouter) sendPropagatedOverLink(link *rns.Link, e *outboundEntry) {
 	data := e.PropagationPacked
 
 	if len(data) <= link.MDU {
-		pkt := rns.NewPacket(link, data)
+		pkt := rns.NewPacket(link, data, rns.PacketTypeData, rns.PacketCtxNone, rns.Broadcast, rns.HeaderType1, nil, nil, true, rns.FlagUnset)
 		receipt := pkt.Send()
 		if receipt == nil {
 			e.NextAttempt = time.Now().Add(deliveryRetryWait)
@@ -571,7 +571,7 @@ func (r *LXMRouter) sendPropagatedOverLink(link *rns.Link, e *outboundEntry) {
 		_, err := rns.NewResource(
 			data, nil, link, nil, true, false,
 			func(res *rns.Resource) {
-				if res != nil && res.Status() == rns.ResourceComplete {
+				if res != nil && res.Status == rns.ResourceComplete {
 					r.log.Info("Propagated resource transfer complete", "id", msgID)
 					r.outbound.markState(msgHash, core.StateSent)
 					r.emit(&event.DeliveryUpdate{MessageHash: msgHash, State: core.StateSent})

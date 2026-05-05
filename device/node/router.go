@@ -189,7 +189,7 @@ func (r *LXMRouter) Start() error {
 	r.destination = dest
 
 	dest.SetPacketCallback(r.handlePacket)
-	_ = dest.SetProofStrategy(rns.DestinationPROVE_ALL)
+	dest.SetProofStrategy(rns.DestinationPROVE_ALL)
 
 	// Set default app_data so that path responses (automatic announces triggered
 	// by incoming path requests) include the correct display name and stamp cost.
@@ -209,7 +209,7 @@ func (r *LXMRouter) Start() error {
 	rns.RegisterAnnounceHandler(&propagationAnnounceHandler{router: r})
 
 	r.log.Info("LXMF router started",
-		"hash", fmt.Sprintf("%x", dest.Hash()),
+		"hash", fmt.Sprintf("%x", dest.Hash),
 		"name", r.cfg.DisplayName,
 	)
 
@@ -240,7 +240,7 @@ func (r *LXMRouter) DeliveryHash() []byte {
 	if r.destination == nil {
 		return nil
 	}
-	return r.destination.Hash()
+	return r.destination.Hash
 }
 
 // Announce sends an lxmf.delivery announce to the network so peers can
@@ -269,7 +269,7 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 		return fmt.Errorf("router not started")
 	}
 
-	msg.SourceHash = r.destination.Hash()
+	msg.SourceHash = r.destination.Hash
 	msg.DestinationHash = destHash
 	destHex := hex.EncodeToString(destHash)
 
@@ -354,7 +354,7 @@ func (r *LXMRouter) Send(destHash []byte, msg *core.LXMessage, method DeliveryMe
 	// Pre-request a path for opportunistic delivery if we don't have one.
 	nextAttempt := time.Now()
 	if method == DeliveryOpportunistic && !rns.HasPath(destHash) {
-		rns.RequestPath(destHash, nil)
+		rns.RequestPath(destHash, nil, nil, false)
 		nextAttempt = time.Now().Add(pathRequestWait)
 	}
 
@@ -447,7 +447,7 @@ func (r *LXMRouter) attemptOpportunistic(e *outboundEntry) {
 			"dest", fmt.Sprintf("%x", destHash[:8]),
 			"attempt", e.Attempts,
 		)
-		rns.RequestPath(destHash, nil)
+		rns.RequestPath(destHash, nil, nil, false)
 		e.NextAttempt = time.Now().Add(pathRequestWait)
 		e.State = core.StateOutbound
 		return
@@ -458,7 +458,7 @@ func (r *LXMRouter) attemptOpportunistic(e *outboundEntry) {
 			"dest", fmt.Sprintf("%x", destHash[:8]),
 			"attempt", e.Attempts,
 		)
-		rns.RequestPath(destHash, nil)
+		rns.RequestPath(destHash, nil, nil, false)
 		e.NextAttempt = time.Now().Add(pathRequestWait)
 		e.State = core.StateOutbound
 		return
@@ -476,7 +476,7 @@ func (r *LXMRouter) attemptOpportunistic(e *outboundEntry) {
 	}
 
 	payload := e.Packed[core.DestHashSize:]
-	pkt := rns.NewPacket(outDest, payload)
+	pkt := rns.NewPacket(outDest, payload, rns.PacketTypeData, rns.PacketCtxNone, rns.Broadcast, rns.HeaderType1, nil, nil, true, rns.FlagUnset)
 	receipt := pkt.Send()
 	if receipt == nil {
 		r.log.Warn("Packet send failed",
@@ -519,14 +519,14 @@ func (r *LXMRouter) attemptDirect(e *outboundEntry) {
 			"dest", fmt.Sprintf("%x", destHash[:8]),
 			"attempt", e.Attempts,
 		)
-		rns.RequestPath(destHash, nil)
+		rns.RequestPath(destHash, nil, nil, false)
 		e.NextAttempt = time.Now().Add(pathRequestWait)
 		e.State = core.StateOutbound
 		return
 	}
 
 	if !rns.HasPath(destHash) {
-		rns.RequestPath(destHash, nil)
+		rns.RequestPath(destHash, nil, nil, false)
 		e.NextAttempt = time.Now().Add(pathRequestWait)
 		e.State = core.StateOutbound
 		return
@@ -540,7 +540,7 @@ func (r *LXMRouter) attemptDirect(e *outboundEntry) {
 	}
 
 	packed := e.Packed
-	link, err := rns.NewOutgoingLink(outDest, rns.LinkModeDefault,
+	link, err := rns.NewLink(outDest, nil, rns.LinkModeDefault,
 		func(l *rns.Link) {
 			r.log.Debug("Link established for direct LXMF delivery",
 				"to", fmt.Sprintf("%x", destHash[:8]),
@@ -618,7 +618,7 @@ func (r *LXMRouter) sendOverLink(link *rns.Link, destHash []byte, packed []byte,
 
 // sendLinkPacket sends a small LXMF message as a link packet.
 func (r *LXMRouter) sendLinkPacket(link *rns.Link, destHash []byte, packed []byte, msgHash []byte, msgID string, msgLen int) {
-	pkt := rns.NewPacket(link, packed)
+	pkt := rns.NewPacket(link, packed, rns.PacketTypeData, rns.PacketCtxNone, rns.Broadcast, rns.HeaderType1, nil, nil, true, rns.FlagUnset)
 	receipt := pkt.Send()
 	if receipt == nil {
 		r.log.Warn("Failed to send LXMF packet over link",
@@ -661,7 +661,7 @@ func (r *LXMRouter) sendLinkResource(link *rns.Link, destHash []byte, packed []b
 			if res == nil {
 				return
 			}
-			if res.Status() == rns.ResourceComplete {
+			if res.Status == rns.ResourceComplete {
 				r.log.Info("LXMF resource transfer complete",
 					"to", fmt.Sprintf("%x", destHash[:8]),
 					"id", msgID,
@@ -671,7 +671,7 @@ func (r *LXMRouter) sendLinkResource(link *rns.Link, destHash []byte, packed []b
 				r.log.Warn("LXMF resource transfer failed",
 					"to", fmt.Sprintf("%x", destHash[:8]),
 					"id", msgID,
-					"status", res.Status(),
+					"status", res.Status,
 				)
 				r.emit(&event.DeliveryUpdate{MessageHash: msgHash, State: core.StateFailed})
 			}
@@ -777,7 +777,7 @@ func (r *LXMRouter) handlePacket(data []byte, pkt *rns.Packet) {
 	// before calling this callback, so we must re-prepend our own hash to
 	// reconstruct the full LXMF wire format for parsing.
 	full := make([]byte, 0, core.DestHashSize+len(data))
-	full = append(full, r.destination.Hash()...)
+	full = append(full, r.destination.Hash...)
 	full = append(full, data...)
 
 	msg, err := core.Unpack(full)
@@ -814,7 +814,7 @@ func (r *LXMRouter) handleLinkEstablished(link *rns.Link) {
 // communication on the same link).
 func (r *LXMRouter) configureLinkCallbacks(link *rns.Link) {
 	link.SetPacketCallback(r.handleLinkPacket)
-	_ = link.SetResourceStrategy(rns.LinkAcceptApp)
+	link.SetResourceStrategy(rns.LinkAcceptApp)
 	link.SetResourceCallback(func(adv *rns.ResourceAdvertisement) bool {
 		limit := r.deliveryLimitBytes()
 		if limit > 0 && adv.D > limit {
@@ -842,7 +842,7 @@ func (r *LXMRouter) deliveryLimitBytes() int {
 // an inbound link. We compute their delivery destination hash and store the
 // link for backchannel reuse.
 func (r *LXMRouter) handleRemoteIdentified(link *rns.Link, identity *rns.Identity) {
-	destHash, err := rns.DestinationHashFromNameAndIdentity(deliveryAspectName, identity)
+	destHash, err := (&rns.Destination{}).HashFromNameAndIdentity(deliveryAspectName, identity)
 	if err != nil {
 		r.log.Debug("Failed to compute dest hash for backchannel link",
 			"error", err,
@@ -882,10 +882,10 @@ func (r *LXMRouter) handleLinkPacket(data []byte, pkt *rns.Packet) {
 // transfer (DIRECT, large message). The resource data is read from its storage
 // file.
 func (r *LXMRouter) handleResourceConcluded(res *rns.Resource) {
-	if res.Status() != rns.ResourceComplete {
+	if res.Status != rns.ResourceComplete {
 		return
 	}
-	path := res.DataFile()
+	path := res.DataFile
 	data, err := os.ReadFile(path)
 	if err != nil {
 		r.log.Debug("Failed to read LXMF resource file", "path", path, "error", err)
@@ -898,7 +898,7 @@ func (r *LXMRouter) handleResourceConcluded(res *rns.Resource) {
 		return
 	}
 	// Store the link as a backchannel for replies.
-	if link := res.Link(); link != nil && link.Status == rns.LinkActive {
+	if link := res.Link; link != nil && link.Status == rns.LinkActive {
 		r.registerBackchannelFromSource(msg.SourceHash, link)
 	}
 	r.dispatchMessage(msg)
