@@ -476,7 +476,7 @@ func (r *LXMRouter) attemptOpportunistic(e *outboundEntry) {
 	}
 
 	payload := e.Packed[core.DestHashSize:]
-	pkt := rns.NewPacket(outDest, payload, rns.PacketTypeData, rns.PacketCtxNone, rns.Broadcast, rns.HeaderType1, nil, nil, true, rns.FlagUnset)
+	pkt := rns.NewPacket(outDest, payload)
 	receipt := pkt.Send()
 	if receipt == nil {
 		r.log.Warn("Packet send failed",
@@ -618,7 +618,7 @@ func (r *LXMRouter) sendOverLink(link *rns.Link, destHash []byte, packed []byte,
 
 // sendLinkPacket sends a small LXMF message as a link packet.
 func (r *LXMRouter) sendLinkPacket(link *rns.Link, destHash []byte, packed []byte, msgHash []byte, msgID string, msgLen int) {
-	pkt := rns.NewPacket(link, packed, rns.PacketTypeData, rns.PacketCtxNone, rns.Broadcast, rns.HeaderType1, nil, nil, true, rns.FlagUnset)
+	pkt := rns.NewPacket(link, packed)
 	receipt := pkt.Send()
 	if receipt == nil {
 		r.log.Warn("Failed to send LXMF packet over link",
@@ -661,7 +661,7 @@ func (r *LXMRouter) sendLinkResource(link *rns.Link, destHash []byte, packed []b
 			if res == nil {
 				return
 			}
-			if res.Status == rns.ResourceComplete {
+			if res.Status() == rns.ResourceComplete {
 				r.log.Info("LXMF resource transfer complete",
 					"to", fmt.Sprintf("%x", destHash[:8]),
 					"id", msgID,
@@ -882,10 +882,10 @@ func (r *LXMRouter) handleLinkPacket(data []byte, pkt *rns.Packet) {
 // transfer (DIRECT, large message). The resource data is read from its storage
 // file.
 func (r *LXMRouter) handleResourceConcluded(res *rns.Resource) {
-	if res.Status != rns.ResourceComplete {
+	if res.Status() != rns.ResourceComplete {
 		return
 	}
-	path := res.DataFile
+	path := res.DataFile()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		r.log.Debug("Failed to read LXMF resource file", "path", path, "error", err)
@@ -898,7 +898,7 @@ func (r *LXMRouter) handleResourceConcluded(res *rns.Resource) {
 		return
 	}
 	// Store the link as a backchannel for replies.
-	if link := res.Link; link != nil && link.Status == rns.LinkActive {
+	if link := res.Link(); link != nil && link.Status == rns.LinkActive {
 		r.registerBackchannelFromSource(msg.SourceHash, link)
 	}
 	r.dispatchMessage(msg)

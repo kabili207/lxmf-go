@@ -3,7 +3,7 @@ module github.com/kabili207/lxmf-go
 go 1.26.1
 
 require (
-	github.com/svanichkin/go-reticulum v1.1.521
+	github.com/svanichkin/go-reticulum v1.1.512
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
@@ -40,4 +40,4 @@ require (
 	tinygo.org/x/bluetooth v0.15.0 // indirect
 )
 
-//replace github.com/svanichkin/go-reticulum => /home/kabili/Projects/Go/go-reticulum-up
+//replace github.com/svanichkin/go-reticulum => /home/kabili/Projects/Go/go-reticulum

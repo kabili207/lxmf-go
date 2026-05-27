@@ -194,7 +194,7 @@ func (r *LXMRouter) sendListRequest(link *rns.Link) {
 
 // messageListResponse handles the response to the list request.
 func (r *LXMRouter) messageListResponse(rr *rns.RequestReceipt) {
-	resp := rr.GetResponse()
+	resp := rr.Response()
 
 	// Check for error codes (returned as integers).
 	if code, ok := asInt(resp); ok {
@@ -306,7 +306,7 @@ func (r *LXMRouter) messageListResponse(rr *rns.RequestReceipt) {
 
 // messageGetResponse handles the response containing actual message data.
 func (r *LXMRouter) messageGetResponse(rr *rns.RequestReceipt) {
-	resp := rr.GetResponse()
+	resp := rr.Response()
 
 	// Check for error codes.
 	if code, ok := asInt(resp); ok {
@@ -405,12 +405,12 @@ func (r *LXMRouter) messageGetResponse(rr *rns.RequestReceipt) {
 func (r *LXMRouter) messageGetProgress(rr *rns.RequestReceipt) {
 	r.propagationMu.Lock()
 	r.propagationState = core.PRReceiving
-	r.propagationProgress = rr.GetProgress()
+	r.propagationProgress = rr.Progress()
 	r.propagationMu.Unlock()
 
 	r.emit(&event.PropagationSyncUpdate{
 		State:    core.PRReceiving,
-		Progress: rr.GetProgress(),
+		Progress: rr.Progress(),
 	})
 }
 
@@ -542,7 +542,7 @@ func (r *LXMRouter) sendPropagatedOverLink(link *rns.Link, e *outboundEntry) {
 	data := e.PropagationPacked
 
 	if len(data) <= link.MDU {
-		pkt := rns.NewPacket(link, data, rns.PacketTypeData, rns.PacketCtxNone, rns.Broadcast, rns.HeaderType1, nil, nil, true, rns.FlagUnset)
+		pkt := rns.NewPacket(link, data)
 		receipt := pkt.Send()
 		if receipt == nil {
 			e.NextAttempt = time.Now().Add(deliveryRetryWait)
@@ -571,7 +571,7 @@ func (r *LXMRouter) sendPropagatedOverLink(link *rns.Link, e *outboundEntry) {
 		_, err := rns.NewResource(
 			data, nil, link, nil, true, false,
 			func(res *rns.Resource) {
-				if res != nil && res.Status == rns.ResourceComplete {
+				if res != nil && res.Status() == rns.ResourceComplete {
 					r.log.Info("Propagated resource transfer complete", "id", msgID)
 					r.outbound.markState(msgHash, core.StateSent)
 					r.emit(&event.DeliveryUpdate{MessageHash: msgHash, State: core.StateSent})
